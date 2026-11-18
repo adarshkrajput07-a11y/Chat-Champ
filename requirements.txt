@@ -1,3 +1,6 @@
-python-telegram-bot>=22.7
-deep-translator>=1.11
-
+python-telegram-bot
+deep-translator
+pyrogram
+tgcrypto
+py-tgcalls
+yt-dlp

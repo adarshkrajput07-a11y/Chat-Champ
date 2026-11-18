@@ -12,9 +12,11 @@ import os
 import re
 import sqlite3
 import time
+import unicodedata
 from collections import defaultdict, deque
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+from types import SimpleNamespace
 
 from deep_translator import GoogleTranslator
 from telegram import (
@@ -22,8 +24,8 @@ from telegram import (
 )
 from telegram.constants import ChatMemberStatus, ParseMode
 from telegram.ext import (
-    Application, CallbackQueryHandler, CommandHandler, ContextTypes,
-    MessageHandler, filters,
+    Application, ApplicationHandlerStop, CallbackQueryHandler, ChatMemberHandler,
+    CommandHandler, ContextTypes, MessageHandler, filters,
 )
 
 # Token and owner id live in config.py (kept out of GitHub).
@@ -95,6 +97,12 @@ CREATE TABLE IF NOT EXISTS warns(chat_id INTEGER, user_id INTEGER, n INTEGER,
     PRIMARY KEY(chat_id, user_id));
 CREATE TABLE IF NOT EXISTS members(chat_id INTEGER, user_id INTEGER,
     PRIMARY KEY(chat_id, user_id));
+CREATE TABLE IF NOT EXISTS chats(chat_id INTEGER PRIMARY KEY, title TEXT, type TEXT);
+CREATE TABLE IF NOT EXISTS bot_users(user_id INTEGER PRIMARY KEY, name TEXT);
+CREATE TABLE IF NOT EXISTS fbans(user_id INTEGER PRIMARY KEY, name TEXT, reason TEXT);
+CREATE TABLE IF NOT EXISTS tags(chat_id INTEGER, username TEXT, tag TEXT,
+    user_id INTEGER, applied INTEGER DEFAULT 0, PRIMARY KEY(chat_id, username));
+CREATE TABLE IF NOT EXISTS locks(chat_id INTEGER, kind TEXT, PRIMARY KEY(chat_id, kind));
 """)
 
 
@@ -182,6 +190,20 @@ async def need_target(update: Update, ctx):
     return t
 
 
+async def is_protected(chat, ctx, user_id):
+    """Admins, the bot owner and the bot itself can't be punished."""
+    if user_id in (OWNER_ID, ctx.bot.id):
+        return True
+    try:
+        m = await chat.get_member(user_id)
+    except Exception:
+        return False
+    return m.status in (ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER)
+
+
+PROTECTED = card("🛡", "protected", sc("admins can't be banned, kicked, muted or warned"))
+
+
 def user_link(uid):
     return f'<a href="tg://user?id={uid}">{uid}</a>'
 
@@ -229,14 +251,38 @@ PAGES = {
         cmd("/promote all", "make admin with all rights"),
         cmd("/demote", "remove admin rights"),
         cmd("/adminlist", "show all admins"),
+        cmd("/lock type", "lock a message type for non-admins"),
+        cmd("/unlock type", "unlock a message type"),
+        cmd("/locks", "show what is locked"),
+        "▫️ " + sc("types:") + " <code>all message stickers gif photo video voice link ...</code>",
         cmd("/tagall", "tag all members, 5 per message"),
         cmd("/tagall text", "tag everyone with a message"),
         cmd("/stoptag", "stop tagging"),
         "▫️ " + sc("target: reply to a user, or use @username / id"),
     ]),
+    "owner": ("🌐", "owner tools", [
+        cmd("/broadcast text", "send to all groups and users"),
+        cmd("/broadcast -groups text", "groups only (or -users)"),
+        cmd("/fban", "ban a user from every group i am in"),
+        cmd("/unfban", "lift a federation ban"),
+        "▫️ <code>/addtag groupid</code> ➜ " + sc("give players their tags"),
+        "▫️ " + sc("then one per line:") + " <code>@username - Tag</code>",
+    ]),
+    "music": ("🎵", "music & video", [
+        cmd("/play name", "play a song in the voice chat"),
+        cmd("/vplay name", "play a song with video"),
+        cmd("/pause", "pause the music"),
+        cmd("/resume", "resume the music"),
+        cmd("/skip", "skip to the next song"),
+        cmd("/end", "stop and leave the voice chat"),
+        cmd("/queue", "show the song queue"),
+        cmd("/autoplay", "toggle autoplay of related songs"),
+        "▫️ " + sc("start a voice chat first, then use /play"),
+    ]),
     "tools": ("🧰", "tools", [
         cmd("/setflood N", "mute spammers, N msgs in 5s (0 = off)"),
         cmd("/id", "reply to a user for their id, or get the group id"),
+        cmd("/kickme", "leave the group (non-admins)"),
         cmd("/tr [lang]", "translate a replied message"),
         cmd("/tr lang text", "translate typed text"),
         cmd("/zombies", "scan for deleted accounts"),
@@ -258,6 +304,8 @@ def help_menu():
         [btn("🔎", "filters", "help:filters", style=OK),
          btn("🧰", "tools", "help:tools", style=RED)],
         [btn("👑", "admins", "help:admin", style=OK),
+         btn("🌐", "owner", "help:owner", style=BLUE)],
+        [btn("🎵", "music", "help:music", style=OK),
          btn("✖️", "close", "close", style=RED)],
     )
 
@@ -298,6 +346,8 @@ async def ban(update, ctx):
     t = await need_target(update, ctx)
     if not t:
         return
+    if await is_protected(update.effective_chat, ctx, t.id):
+        return await say(update, PROTECTED)
     await update.effective_chat.ban_member(t.id)
     await say(update, card("🔨", "user banned", L("user", t.mention_html()),
                            L("by", update.effective_user.mention_html())),
@@ -318,6 +368,8 @@ async def kick(update, ctx):
     t = await need_target(update, ctx)
     if not t:
         return
+    if await is_protected(update.effective_chat, ctx, t.id):
+        return await say(update, PROTECTED)
     await update.effective_chat.ban_member(t.id)
     await update.effective_chat.unban_member(t.id)
     await say(update, card("👢", "user kicked", L("user", t.mention_html()),
@@ -329,6 +381,8 @@ async def mute(update, ctx):
     t = await need_target(update, ctx)
     if not t:
         return
+    if await is_protected(update.effective_chat, ctx, t.id):
+        return await say(update, PROTECTED)
     await update.effective_chat.restrict_member(t.id, MUTED)
     await say(update, card("🔇", "user muted", L("user", t.mention_html()),
                            L("by", update.effective_user.mention_html())),
@@ -491,6 +545,8 @@ async def warn(update, ctx):
     t = await need_target(update, ctx)
     if not t:
         return
+    if await is_protected(update.effective_chat, ctx, t.id):
+        return await say(update, PROTECTED)
     cid = update.effective_chat.id
     db.execute("INSERT OR IGNORE INTO warns VALUES(?,?,0)", (cid, t.id))
     db.execute("UPDATE warns SET n=n+1 WHERE chat_id=? AND user_id=?", (cid, t.id))
@@ -645,8 +701,9 @@ async def on_new_members(update: Update, ctx):
     if not get_setting(chat.id, "welcome_on"):
         return
     for u in update.message.new_chat_members:
-        if not u.is_bot:
-            await send_welcome(chat, u)
+        if u.is_bot or db.execute("SELECT 1 FROM fbans WHERE user_id=?", (u.id,)).fetchone():
+            continue
+        await send_welcome(chat, u)
 
 
 @admin_only
@@ -853,6 +910,397 @@ async def stoptag(update: Update, ctx):
         await say(update, card("ℹ️", "nothing to stop", sc("no tagging is running")))
 
 
+# ---------------------------------------------------------------- owner tools
+OWNER_ONLY = card("🔒", "owner only", sc("only the bot owner can use this command"))
+
+
+def _dead(err):
+    t = str(err).lower()
+    return any(x in t for x in ("blocked", "kicked", "chat not found", "deactivated",
+                                "not a member", "forbidden"))
+
+
+async def _run_broadcast(bot, report_chat, src, text, targets):
+    sent = failed = 0
+    for cid in targets:
+        for attempt in range(2):
+            try:
+                if src:
+                    await bot.copy_message(cid, src.chat_id, src.message_id)
+                else:
+                    await bot.send_message(cid, text, parse_mode=ParseMode.HTML)
+                sent += 1
+                break
+            except Exception as e:
+                wait = getattr(e, "retry_after", None)
+                if wait and attempt == 0:
+                    await asyncio.sleep(wait + 1)
+                    continue
+                failed += 1
+                if _dead(e):  # forget chats that no longer exist / blocked the bot
+                    db.execute("DELETE FROM chats WHERE chat_id=?", (cid,))
+                    db.execute("DELETE FROM bot_users WHERE user_id=?", (cid,))
+                    db.commit()
+                break
+        await asyncio.sleep(0.1)
+    await bot.send_message(report_chat, card("📣", "broadcast finished",
+                                             L("sent", sent), L("failed", failed)),
+                           parse_mode=ParseMode.HTML)
+
+
+async def broadcast(update: Update, ctx):
+    msg = update.message
+    if update.effective_user.id != OWNER_ID:
+        return await say(update, OWNER_ONLY)
+    src = msg.reply_to_message
+    parts = (msg.text_html or "").split(None, 1)
+    text = parts[1] if len(parts) > 1 else ""
+    mode = "all"
+    first = text.split(None, 1)
+    if first and first[0].lower() in ("-groups", "-g"):
+        mode, text = "groups", (first[1] if len(first) > 1 else "")
+    elif first and first[0].lower() in ("-users", "-u"):
+        mode, text = "users", (first[1] if len(first) > 1 else "")
+    if not src and not text:
+        return await say(update, card(
+            "ℹ️", "usage", "<code>/broadcast your message</code>",
+            f"{sc('or reply to a message with')} <code>/broadcast</code>",
+            f"{sc('add')} <code>-groups</code> {sc('or')} <code>-users</code> {sc('to limit it')}"))
+    targets = []
+    if mode in ("all", "groups"):
+        targets += [r[0] for r in db.execute(
+            "SELECT chat_id FROM chats WHERE type IN ('group','supergroup')")]
+    if mode in ("all", "users"):
+        targets += [r[0] for r in db.execute("SELECT user_id FROM bot_users")]
+    if not targets:
+        return await say(update, card("📣", "no chats known yet",
+                                      sc("i learn groups and users as they use me")))
+    await say(update, card("📣", "broadcast started", L("chats", len(targets))))
+    ctx.application.create_task(
+        _run_broadcast(ctx.bot, update.effective_chat.id, src, text, targets))
+
+
+async def resolve_global(update: Update, ctx):
+    """Reply, text-mention, numeric id or @username seen in any group."""
+    msg = update.message
+    if msg.reply_to_message:
+        return msg.reply_to_message.from_user
+    for ent in msg.entities or []:
+        if ent.type == "text_mention" and ent.user:
+            return ent.user
+    for arg in ctx.args or []:
+        if arg.startswith("@") and len(arg) > 1:
+            row = db.execute(
+                "SELECT user_id, username, name FROM members WHERE lower(username)=? LIMIT 1",
+                (arg[1:].lower(),)).fetchone()
+            if row:
+                return User(id=row[0], first_name=row[2] or row[1] or str(row[0]),
+                            is_bot=False, username=row[1])
+            return None
+        if arg.isdigit() and len(arg) >= 6:
+            return User(id=int(arg), first_name=arg, is_bot=False)
+    return None
+
+
+def _groups():
+    return [r[0] for r in db.execute(
+        "SELECT chat_id FROM chats WHERE type IN ('group','supergroup')")]
+
+
+async def _run_fban(bot, report_chat, user, groups, lift=False):
+    ok = failed = 0
+    for gid in groups:
+        try:
+            if lift:
+                await bot.unban_chat_member(gid, user.id, only_if_banned=True)
+            else:
+                await bot.ban_chat_member(gid, user.id)
+            ok += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.1)
+    await bot.send_message(report_chat, card(
+        "🌐", "federation unban finished" if lift else "federation ban finished",
+        L("user", user.mention_html()), L("groups done", ok), L("failed", failed),
+        f"<i>{sc('failed = groups where i am not an admin with ban rights')}</i>"),
+        parse_mode=ParseMode.HTML)
+
+
+async def fban(update: Update, ctx):
+    if update.effective_user.id != OWNER_ID:
+        return await say(update, OWNER_ONLY)
+    t = await resolve_global(update, ctx)
+    if not t:
+        return await say(update, card(
+            "🔎", "user not found", sc("reply to the user, or use their @username / id"),
+            f"<i>{sc('usernames work for people the bot has seen in a group')}</i>"))
+    if t.id in (OWNER_ID, ctx.bot.id):
+        return await say(update, PROTECTED)
+    args = [a for a in ctx.args if not (a.startswith("@") or a.isdigit())]
+    reason = " ".join(args)[:200]
+    db.execute("INSERT OR REPLACE INTO fbans VALUES(?,?,?)", (t.id, t.first_name, reason))
+    db.commit()
+    groups = _groups()
+    await say(update, card("🌐", "federation ban started", L("user", t.mention_html()),
+                           L("groups", len(groups)),
+                           *([L("reason", esc(reason))] if reason else [])))
+    ctx.application.create_task(_run_fban(ctx.bot, update.effective_chat.id, t, groups))
+
+
+async def unfban(update: Update, ctx):
+    if update.effective_user.id != OWNER_ID:
+        return await say(update, OWNER_ONLY)
+    t = await resolve_global(update, ctx)
+    if not t:
+        return await say(update, card("🔎", "user not found",
+                                      sc("reply to the user, or use their @username / id")))
+    db.execute("DELETE FROM fbans WHERE user_id=?", (t.id,))
+    db.commit()
+    fban_done.difference_update({k for k in fban_done if k[1] == t.id})
+    groups = _groups()
+    await say(update, card("🌐", "federation unban started", L("user", t.mention_html()),
+                           L("groups", len(groups))))
+    ctx.application.create_task(
+        _run_fban(ctx.bot, update.effective_chat.id, t, groups, lift=True))
+
+
+async def kickme(update: Update, ctx):
+    chat, user = update.effective_chat, update.effective_user
+    if chat.type == "private":
+        return await say(update, card("👥", "groups only", sc("use this command in a group")))
+    if await is_admin(chat, user.id):
+        return await say(update, card("🔒", "not for admins", sc("only non-admins can use /kickme")))
+    await chat.ban_member(user.id)
+    await chat.unban_member(user.id)
+    await say(update, card("👋", "goodbye", L("user", user.mention_html()),
+                           sc("left the group")))
+
+
+# ---------------------------------------------------------------- member tags
+TAG_LINE = re.compile(r"^\s*@?([A-Za-z0-9_]{3,32})\s*[-\u2013\u2014:=]+\s*(.+?)\s*$")
+
+
+def bad_tag(tag):
+    if len(tag) > 16:
+        return "max 16 characters"
+    if any(ord(c) >= 0x1F000 or unicodedata.category(c) in ("So", "Sk") for c in tag):
+        return "emoji not allowed"
+    return None
+
+
+async def apply_tag(bot, chat_id, user_id, tag):
+    try:
+        await bot.set_chat_member_tag(chat_id, user_id, tag)
+        return True, None
+    except Exception as e:
+        logging.warning("set tag failed in %s for %s: %s", chat_id, user_id, e)
+        return False, str(e)
+
+
+async def addtag(update: Update, ctx):
+    msg, user = update.message, update.effective_user
+    lines = (msg.text or "").splitlines()
+    head = lines[0].split() if lines else []
+    body = [ln for ln in lines[1:] if ln.strip()]
+    chat_id = None
+    if len(head) > 1 and re.fullmatch(r"-?\d+", head[1]):
+        chat_id = int(head[1])
+    elif update.effective_chat.type != "private":
+        chat_id = update.effective_chat.id
+    if chat_id is None or not body:
+        return await say(update, card(
+            "ℹ️", "usage", "<code>/addtag groupid</code>", "<code>@username - Tag</code>",
+            "<code>@username - Tag</code>",
+            f"<i>{sc('one player per line, tag max 16 characters, no emoji')}</i>"))
+    try:
+        chat = await ctx.bot.get_chat(chat_id)
+    except Exception:
+        return await say(update, card("❌", "group not found",
+                                      sc("add me to that group first, then check the group id")))
+    if not await is_admin(chat, user.id):
+        return await say(update, card("🔒", "admins only",
+                                      sc("only admins of that group can add tags")))
+    results, shown = [], 0
+    for ln in body:
+        m = TAG_LINE.match(ln)
+        if not m:
+            results.append(f"❌ <code>{esc(ln[:40])}</code> ➜ {sc('wrong format')}")
+            continue
+        uname, tag = m.group(1), m.group(2)
+        err = bad_tag(tag)
+        if err:
+            results.append(f"❌ @{esc(uname)} ➜ {sc(err)}")
+            continue
+        db.execute(
+            "INSERT INTO tags(chat_id, username, tag, user_id, applied) VALUES(?,?,?,NULL,0) "
+            "ON CONFLICT(chat_id, username) DO UPDATE SET tag=excluded.tag, applied=0",
+            (chat_id, uname.lower(), tag))
+        row = db.execute("SELECT user_id FROM members WHERE chat_id=? AND lower(username)=?",
+                         (chat_id, uname.lower())).fetchone()
+        if row:
+            ok, why = await apply_tag(ctx.bot, chat_id, row[0], tag)
+            if ok:
+                db.execute("UPDATE tags SET applied=1, user_id=? WHERE chat_id=? AND username=?",
+                           (row[0], chat_id, uname.lower()))
+                results.append(f"✅ @{esc(uname)} ➜ <b>{esc(tag)}</b>")
+            else:
+                results.append(f"⚠️ @{esc(uname)} ➜ {esc((why or '')[:60])}")
+        else:
+            results.append(f"⏳ @{esc(uname)} ➜ <b>{esc(tag)}</b> "
+                           f"<i>({sc('saved, applied when seen')})</i>")
+    db.commit()
+    extra = f"\n… +{len(results) - 40}" if len(results) > 40 else ""
+    await say(update, card("🏷", "tags saved", L("group", esc(chat.title or str(chat_id))),
+                           "", *results[:40]) + extra +
+              f"\n\n<i>{sc('the bot needs the edit member tags admin right')}</i>")
+
+
+# ---------------------------------------------------------------- locks
+LOCK_TYPES = ("message", "stickers", "gif", "photo", "video", "audio", "voice",
+              "document", "videonote", "poll", "link", "forward", "contact", "location")
+MEDIA = ("photo", "video", "gif", "audio", "voice", "document", "videonote")
+LOCK_ALIASES = {
+    "messages": "message", "text": "message", "msg": "message",
+    "sticker": "stickers", "gifs": "gif", "animation": "gif",
+    "photos": "photo", "pics": "photo", "videos": "video", "voices": "voice",
+    "documents": "document", "docs": "document", "files": "document", "file": "document",
+    "links": "link", "url": "link", "urls": "link", "forwards": "forward",
+    "polls": "poll", "video_note": "videonote", "contacts": "contact",
+}
+TYPES_HELP = ("<code>all media message stickers gif photo video audio voice "
+              "document videonote poll link forward contact location</code>")
+
+
+def parse_lock_args(args):
+    kinds, bad = set(), []
+    for a in args:
+        a = a.lower().strip(",")
+        if a == "all":
+            kinds.update(LOCK_TYPES)
+        elif a == "media":
+            kinds.update(MEDIA)
+        else:
+            a = LOCK_ALIASES.get(a, a)
+            if a in LOCK_TYPES:
+                kinds.add(a)
+            else:
+                bad.append(a)
+    return kinds, bad
+
+
+def locked_kinds(chat_id):
+    return {r[0] for r in db.execute("SELECT kind FROM locks WHERE chat_id=?", (chat_id,))}
+
+
+def _names(kinds):
+    if set(LOCK_TYPES) <= set(kinds):
+        return sc("everything")
+    return " ".join(f"<code>{k}</code>" for k in sorted(kinds))
+
+
+@admin_only
+async def lock(update: Update, ctx):
+    chat = update.effective_chat
+    kinds, bad = parse_lock_args(ctx.args)
+    if not kinds:
+        extra = [f"{sc('unknown type')}: <code>{esc(', '.join(bad))}</code>"] if bad else []
+        return await say(update, card("ℹ️", "usage", "<code>/lock all</code>",
+                                      "<code>/lock message</code>  <code>/lock stickers</code>  <code>/lock gif</code>",
+                                      f"{sc('types')}: {TYPES_HELP}", *extra))
+    db.executemany("INSERT OR IGNORE INTO locks VALUES(?,?)", [(chat.id, k) for k in kinds])
+    db.commit()
+    lines = [L("locked", _names(kinds)), f"<i>{sc('admins are not affected')}</i>"]
+    try:
+        bm = await chat.get_member(ctx.bot.id)
+        if not getattr(bm, "can_delete_messages", False):
+            lines.append(f"⚠️ {sc('i need the delete messages admin right to enforce this')}")
+    except Exception:
+        pass
+    await say(update, card("🔒", "locked", *lines))
+
+
+@admin_only
+async def unlock(update: Update, ctx):
+    chat = update.effective_chat
+    kinds, bad = parse_lock_args(ctx.args)
+    if not kinds:
+        return await say(update, card("ℹ️", "usage", "<code>/unlock all</code>",
+                                      "<code>/unlock gif</code>", f"{sc('types')}: {TYPES_HELP}"))
+    db.executemany("DELETE FROM locks WHERE chat_id=? AND kind=?", [(chat.id, k) for k in kinds])
+    db.commit()
+    await say(update, card("🔓", "unlocked", L("unlocked", _names(kinds))))
+
+
+async def locks_cmd(update: Update, ctx):
+    cur = locked_kinds(update.effective_chat.id)
+    lines = [f"{'🔒' if k in cur else '🔓'} <code>{k}</code>" for k in LOCK_TYPES]
+    await say(update, card("🔐", "locks", *lines, "",
+                           f"<i>{sc('admins are never affected')}</i>"))
+
+
+_admin_cache = {}  # chat_id -> (time, set of admin ids)
+
+
+async def _admin_ids(chat):
+    hit = _admin_cache.get(chat.id)
+    if hit and time.time() - hit[0] < 60:
+        return hit[1]
+    ids = {m.user.id for m in await chat.get_administrators()}
+    _admin_cache[chat.id] = (time.time(), ids)
+    return ids
+
+
+def message_kinds(msg):
+    k = set()
+    if msg.sticker:
+        k.add("stickers")
+    if msg.animation:
+        k.add("gif")
+    elif msg.document:
+        k.add("document")
+    if msg.photo:
+        k.add("photo")
+    if msg.video:
+        k.add("video")
+    if msg.audio:
+        k.add("audio")
+    if msg.voice:
+        k.add("voice")
+    if msg.video_note:
+        k.add("videonote")
+    if msg.poll:
+        k.add("poll")
+    if msg.contact:
+        k.add("contact")
+    if msg.location or msg.venue:
+        k.add("location")
+    if msg.forward_origin:
+        k.add("forward")
+    if any(e.type in ("url", "text_link") for e in (msg.entities or msg.caption_entities or [])):
+        k.add("link")
+    if msg.text and not msg.text.startswith("/"):  # commands stay usable
+        k.add("message")
+    return k
+
+
+async def enforce_locks(update: Update, ctx):
+    msg, chat, user = update.effective_message, update.effective_chat, update.effective_user
+    if not msg or not user or msg.sender_chat or msg.is_automatic_forward:
+        return
+    if user.id in (OWNER_ID, 1087968824, 136817688):  # owner, anonymous admin, channel bot
+        return
+    locked = locked_kinds(chat.id)
+    if not locked or not (message_kinds(msg) & locked):
+        return
+    if user.id in await _admin_ids(chat) or await is_admin(chat, user.id):
+        return
+    try:
+        await msg.delete()
+    except Exception:
+        return  # no delete right
+    raise ApplicationHandlerStop
+
+
 # ---------------------------------------------------------------- id
 async def id_cmd(update: Update, ctx):
     chat, user = update.effective_chat, update.effective_user
@@ -902,21 +1350,79 @@ async def translate(update: Update, ctx):
 
 
 # ---------------------------------------------------------------- deleted accounts
+fban_done = set()   # (chat, user) pairs already handled this run
+tag_tried = set()   # (chat, user) pairs we already tried to tag this run
+
+
 async def track(update: Update, ctx):
-    """Remember who has been seen in each group (Bot API can't list members)."""
+    """Remember chats and who has been seen (Bot API can't list members);
+    also enforces federation bans and gives saved tags."""
     chat, msg = update.effective_chat, update.message
+    db.execute(
+        "INSERT INTO chats(chat_id, title, type) VALUES(?,?,?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, type=excluded.type",
+        (chat.id, chat.title, chat.type))
     users = [update.effective_user] if update.effective_user else []
     if msg and msg.new_chat_members:
         users += msg.new_chat_members
     if msg and msg.reply_to_message and msg.reply_to_message.from_user:
         users.append(msg.reply_to_message.from_user)
     for u in users:
-        if not u.is_bot:
-            db.execute(
-                "INSERT INTO members(chat_id, user_id, username, name) VALUES(?,?,?,?) "
-                "ON CONFLICT(chat_id, user_id) DO UPDATE SET "
-                "username=excluded.username, name=excluded.name",
-                (chat.id, u.id, u.username, u.first_name))
+        if u.is_bot:
+            continue
+        if db.execute("SELECT 1 FROM fbans WHERE user_id=?", (u.id,)).fetchone():
+            if (chat.id, u.id) not in fban_done:
+                fban_done.add((chat.id, u.id))
+                try:
+                    await chat.ban_member(u.id)
+                    await chat.send_message(card(
+                        "🌐", "federation ban", L("user", u.mention_html()),
+                        sc("banned from all groups")), parse_mode=ParseMode.HTML)
+                except Exception:
+                    pass
+            continue
+        db.execute(
+            "INSERT INTO members(chat_id, user_id, username, name) VALUES(?,?,?,?) "
+            "ON CONFLICT(chat_id, user_id) DO UPDATE SET "
+            "username=excluded.username, name=excluded.name",
+            (chat.id, u.id, u.username, u.first_name))
+        if u.username and (chat.id, u.id) not in tag_tried:
+            row = db.execute(
+                "SELECT tag FROM tags WHERE chat_id=? AND username=? AND applied=0",
+                (chat.id, u.username.lower())).fetchone()
+            if row:
+                tag_tried.add((chat.id, u.id))
+                ok, _err = await apply_tag(ctx.bot, chat.id, u.id, row[0])
+                if ok:
+                    db.execute("UPDATE tags SET applied=1, user_id=? "
+                               "WHERE chat_id=? AND username=?",
+                               (u.id, chat.id, u.username.lower()))
+    db.commit()
+
+
+async def track_private(update: Update, ctx):
+    u = update.effective_user
+    if u and not u.is_bot:
+        db.execute(
+            "INSERT INTO bot_users(user_id, name) VALUES(?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name", (u.id, u.first_name))
+        db.commit()
+
+
+async def on_my_chat_member(update: Update, ctx):
+    """The bot was added to / removed from a chat (or a user blocked the bot)."""
+    ev = update.my_chat_member
+    chat, status = ev.chat, ev.new_chat_member.status
+    if chat.type == "private":
+        if status in (ChatMemberStatus.BANNED, ChatMemberStatus.LEFT):
+            db.execute("DELETE FROM bot_users WHERE user_id=?", (chat.id,))
+    elif status in (ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR):
+        db.execute(
+            "INSERT INTO chats(chat_id, title, type) VALUES(?,?,?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET title=excluded.title, type=excluded.type",
+            (chat.id, chat.title, chat.type))
+    else:
+        db.execute("DELETE FROM chats WHERE chat_id=?", (chat.id,))
     db.commit()
 
 
@@ -1037,7 +1543,19 @@ async def on_error(update, ctx):
 def main():
     if not BOT_TOKEN:
         raise SystemExit("Missing bot token: create config.py (see config.example.py)")
-    app = Application.builder().token(BOT_TOKEN).build()
+    try:
+        import music  # optional: needs API_ID, API_HASH, SESSION_STRING
+    except Exception:
+        logging.exception("music.py could not be loaded")
+        music = None
+    builder = Application.builder().token(BOT_TOKEN)
+    if music:
+        builder = builder.post_init(music.start).post_shutdown(music.stop)
+    app = builder.build()
+    if music:  # registered before the generic button handler
+        music.register(app, SimpleNamespace(
+            card=card, L=L, sc=sc, esc=esc, btn=btn, kb=kb, say=say, is_admin=is_admin,
+            OK=OK, BLUE=BLUE, RED=RED))
     cmds = {
         "start": start, "help": help_cmd,
         "ban": ban, "unban": unban, "kick": kick, "mute": mute, "unmute": unmute,
@@ -1047,12 +1565,19 @@ def main():
         "setrules": setrules, "rules": rules,
         "save": save, "get": get_note, "notes": notes, "clear": clear,
         "filter": add_filter, "stop": stop_filter, "filters": list_filters,
+        "broadcast": broadcast, "fban": fban, "unfban": unfban, "kickme": kickme,
+        "addtag": addtag,
+        "lock": lock, "unlock": unlock, "locks": locks_cmd,
         "setflood": setflood, "id": id_cmd, "tr": translate, "zombies": zombies,
         "tagall": tagall, "stoptag": stoptag, "purge": purge, "promote": promote, "demote": demote, "adminlist": adminlist,
     }
     for name, fn in cmds.items():
         app.add_handler(CommandHandler(name, fn))
     app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(MessageHandler(filters.ChatType.GROUPS & ~filters.StatusUpdate.ALL,
+                                   enforce_locks), group=-3)
+    app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
+    app.add_handler(MessageHandler(filters.ChatType.PRIVATE, track_private), group=-1)
     app.add_handler(MessageHandler(filters.ChatType.GROUPS, track), group=-1)
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))

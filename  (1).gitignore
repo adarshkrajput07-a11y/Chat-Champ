@@ -1,0 +1,5 @@
+config.py
+*.db
+*.session
+cookies.txt
+__pycache__/

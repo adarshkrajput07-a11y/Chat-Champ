@@ -1548,7 +1548,10 @@ def main():
     except Exception:
         logging.exception("music.py could not be loaded")
         music = None
-    builder = Application.builder().token(BOT_TOKEN)
+    builder = (Application.builder().token(BOT_TOKEN)
+               .connect_timeout(30).read_timeout(30)
+               .write_timeout(30).pool_timeout(30)
+               .get_updates_connect_timeout(30).get_updates_read_timeout(30))
     if music:
         builder = builder.post_init(music.start).post_shutdown(music.stop)
     app = builder.build()
@@ -1582,7 +1585,7 @@ def main():
     app.add_handler(MessageHandler(filters.StatusUpdate.NEW_CHAT_MEMBERS, on_new_members))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_error_handler(on_error)
-    app.run_polling()
+    app.run_polling(bootstrap_retries=-1)
 
 
 if __name__ == "__main__":

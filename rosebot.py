@@ -1543,6 +1543,13 @@ async def on_error(update, ctx):
 def main():
     if not BOT_TOKEN:
         raise SystemExit("Missing bot token: create config.py (see config.example.py)")
+    # --- startup diagnostics (shows in Railway logs) ---
+    import urllib.request
+    try:
+        r = urllib.request.urlopen(f"https://api.telegram.org/bot{BOT_TOKEN}/getMe", timeout=20)
+        print("TELEGRAM CHECK OK:", r.status, r.read()[:120], flush=True)
+    except Exception as e:
+        print("TELEGRAM CHECK FAILED:", repr(e), flush=True)
     try:
         import music  # optional: needs API_ID, API_HASH, SESSION_STRING
     except Exception:

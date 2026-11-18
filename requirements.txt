@@ -4,3 +4,5 @@ pyrogram
 tgcrypto
 py-tgcalls
 yt-dlp
+Pillow
+httpx
